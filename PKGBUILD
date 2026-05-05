@@ -13,7 +13,7 @@ optdepends=(
     'looking-glass: low-latency VM display client'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('c138f45c36064993faea2d0aafd5cf82d9a77b372f915f2697c8e5fc40841026')
 
 package() {
     cd "$pkgname-$pkgver"
