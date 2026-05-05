@@ -509,7 +509,7 @@ _stop_tracked_services() {
 }
 
 passthrough_on() {
-    echo "=== Enabling GPU passthrough ==="
+    echo "=== Enabling GPU VFIO passthrough ==="
 
     # Detect GPU
     local detection
@@ -655,12 +655,12 @@ passthrough_on() {
     # Restart stopped services — they will now bind to iGPU since dGPU is gone
     _restart_stopped_services
 
-    echo "=== GPU passthrough enabled ==="
+    echo "=== GPU VFIO passthrough enabled ==="
     echo "You can now start your VM with GPU passthrough."
 }
 
 passthrough_off() {
-    echo "=== Disabling GPU passthrough ==="
+    echo "=== Disabling GPU VFIO passthrough ==="
 
     # Stop services that were restarted on iGPU, before switching driver back
     _stop_tracked_services
@@ -744,11 +744,11 @@ passthrough_off() {
     _restart_stopped_services
     rm -f "$_STOPPED_SERVICES_FILE"
 
-    echo "=== GPU passthrough disabled ==="
+    echo "=== GPU VFIO passthrough disabled ==="
 }
 
 passthrough_status() {
-    echo "=== GPU Passthrough Status ==="
+    echo "=== GPU VFIO Hotswitch Status ==="
 
     # Show GPU devices and their current drivers
     echo ""
