@@ -599,8 +599,39 @@ passthrough_on() {
             fi
             ;;
         amd)
+            # AMD uses /dev/dri/renderD* — find processes using the dGPU render node
+            echo "Stopping AMD GPU users..."
+            local amd_render=""
+            for addr in "${gpu_addrs[@]}"; do
+                local base="${addr%.*}.0"
+                local rdev="/dev/dri/by-path/pci-${base}-render"
+                if [[ -e "$rdev" ]]; then
+                    amd_render=$(readlink -f "$rdev")
+                    break
+                fi
+            done
+            if [[ -n "$amd_render" ]]; then
+                local amd_pids
+                amd_pids=$(fuser "$amd_render" 2>/dev/null | tr -s ' ') || true
+                if [[ -n "$amd_pids" ]]; then
+                    echo "  Processes using AMD dGPU ($amd_render):"
+                    fuser -v "$amd_render" 2>/dev/null || true
+                    echo "  Sending SIGTERM..."
+                    for p in $amd_pids; do
+                        p="${p%%[a-zA-Z]*}"
+                        [[ -n "$p" ]] && kill -TERM "$p" 2>/dev/null || true
+                    done
+                    sleep 2
+                fi
+            fi
+
             echo "Unloading AMD GPU module..."
             rmmod amdgpu 2>/dev/null || true
+
+            if lsmod | grep -q '^amdgpu'; then
+                echo "WARNING: amdgpu module still loaded."
+                echo "  Some processes may still be using the GPU."
+            fi
             ;;
     esac
 
@@ -661,6 +692,13 @@ passthrough_on() {
 
 passthrough_off() {
     echo "=== Disabling GPU VFIO passthrough ==="
+
+    # Check if passthrough is actually active
+    if [[ ! -d /sys/bus/pci/drivers/vfio-pci ]] || \
+       ! ls /sys/bus/pci/drivers/vfio-pci/*/vendor &>/dev/null; then
+        echo "GPU passthrough is not active. Nothing to do."
+        return 0
+    fi
 
     # Stop services that were restarted on iGPU, before switching driver back
     _stop_tracked_services
