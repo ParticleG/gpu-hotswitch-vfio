@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# gpu-passthrough - Hot-switch GPU passthrough for KVM virtual machines
-# Usage: gpu-passthrough {on|off|status}
+# gpu-hotswitch-vfio - Hot-switch GPU passthrough for KVM virtual machines
+# Usage: gpu-hotswitch-vfio {on|off|status}
 #
 # Automatically detects discrete GPU (NVIDIA or AMD) and manages:
 # - Driver unbinding/rebinding
@@ -257,7 +257,7 @@ configure_compositor_ignore_dgpu() {
 
 # Global array to track stopped services for restart during passthrough_off
 _stopped_gpu_services=()
-_STOPPED_SERVICES_FILE="/run/gpu-passthrough-stopped-services"
+_STOPPED_SERVICES_FILE="/run/gpu-hotswitch-vfio-stopped-services"
 
 safe_kill_nvidia_users() {
     # Collect unique PIDs using /dev/nvidia*
@@ -793,7 +793,7 @@ case "${1:-}" in
     off) passthrough_off ;;
     status) passthrough_status ;;
     *)
-        echo "Usage: gpu-passthrough {on|off|status}" >&2
+        echo "Usage: gpu-hotswitch-vfio {on|off|status}" >&2
         exit 1
         ;;
 esac

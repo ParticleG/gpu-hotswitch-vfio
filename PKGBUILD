@@ -1,10 +1,10 @@
-# Maintainer: ParticleG <particle_g@outlook.com>
-pkgname=gpu-passthrough
+# Maintainer: ParticleG <particle_g at outlook dot com>
+pkgname=gpu-hotswitch-vfio
 pkgver=1.0.0
 pkgrel=1
-pkgdesc="Hot-switch GPU passthrough for KVM virtual machines"
+pkgdesc="Hot-switch discrete GPU between host and VFIO passthrough without reboot"
 arch=('any')
-url="https://github.com/ParticleG/gpu-passthrough"
+url="https://github.com/ParticleG/gpu-hotswitch-vfio"
 license=('MIT')
 depends=('bash' 'util-linux' 'pciutils' 'kmod')
 optdepends=(

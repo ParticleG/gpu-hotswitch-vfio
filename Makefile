@@ -4,7 +4,7 @@ BINDIR ?= $(PREFIX)/bin
 .PHONY: install uninstall
 
 install:
-	install -Dm755 gpu-passthrough $(DESTDIR)$(BINDIR)/gpu-passthrough
+	install -Dm755 gpu-hotswitch-vfio $(DESTDIR)$(BINDIR)/gpu-hotswitch-vfio
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/gpu-passthrough
+	rm -f $(DESTDIR)$(BINDIR)/gpu-hotswitch-vfio

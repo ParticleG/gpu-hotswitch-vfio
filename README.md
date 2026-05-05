@@ -1,6 +1,8 @@
-# gpu-passthrough
+# gpu-hotswitch-vfio
 
-Hot-switch GPU passthrough for KVM virtual machines on hybrid GPU laptops (NVIDIA/AMD discrete + integrated GPU).
+Hot-switch discrete GPU between host and VFIO passthrough for KVM virtual machines — no reboot required.
+
+Designed for hybrid GPU laptops (NVIDIA/AMD discrete + integrated GPU) to dynamically bind/unbind the discrete GPU to `vfio-pci` for VM passthrough.
 
 ## Features
 
@@ -22,24 +24,20 @@ sudo make install
 ### Arch Linux (AUR)
 
 ```bash
-# With an AUR helper
-paru -S gpu-passthrough
-
-# Or manually
-makepkg -si
+paru -S gpu-hotswitch-vfio
 ```
 
 ## Usage
 
 ```bash
 # Enable GPU passthrough (binds dGPU to vfio-pci)
-sudo gpu-passthrough on
+sudo gpu-hotswitch-vfio on
 
 # Check current status
-sudo gpu-passthrough status
+sudo gpu-hotswitch-vfio status
 
 # Disable GPU passthrough (restores original driver)
-sudo gpu-passthrough off
+sudo gpu-hotswitch-vfio off
 ```
 
 ## Requirements
@@ -50,7 +48,7 @@ sudo gpu-passthrough off
 
 ## How it works
 
-### `gpu-passthrough on`
+### `gpu-hotswitch-vfio on`
 
 1. Detects discrete GPU and all devices in its IOMMU group
 2. Configures compositor (niri) to ignore dGPU DRM devices
@@ -62,7 +60,7 @@ sudo gpu-passthrough off
 8. Allocates hugepages (1GB pages, incrementally)
 9. Restarts stopped services (they rebind to iGPU if possible)
 
-### `gpu-passthrough off`
+### `gpu-hotswitch-vfio off`
 
 1. Stops services that were restarted on iGPU
 2. Unbinds devices from vfio-pci
