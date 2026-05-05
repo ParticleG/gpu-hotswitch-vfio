@@ -1,0 +1,28 @@
+name: Publish to AUR
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  aur-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update PKGBUILD version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
+        with:
+          pkgname: gpu-hotswitch-vfio
+          pkgbuild: ./PKGBUILD
+          commit_username: ParticleG
+          commit_email: particle_g@outlook.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to v${{ github.ref_name }}"
