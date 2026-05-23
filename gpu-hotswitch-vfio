@@ -260,17 +260,49 @@ _stopped_gpu_services=()
 _STOPPED_SERVICES_FILE="/run/gpu-hotswitch-vfio-stopped-services"
 
 safe_kill_nvidia_users() {
-    # Collect unique PIDs using /dev/nvidia*
-    local -A seen_pids=()
-    local -a pids=()
+    # Collect unique PIDs using NVIDIA GPU devices.
+    # Two-tier detection:
+    #   - "blocking" devices: /dev/nvidia0, /dev/nvidia-modeset, /dev/nvidia-uvm*
+    #     These hold actual GPU resources and MUST be released for driver unload.
+    #   - "non-blocking" device: /dev/nvidiactl
+    #     Only the control interface; processes holding only this do NOT prevent
+    #     driver unload and can be safely ignored.
+    local -A blocking_pids=()
+    local -A ctl_only_pids=()
     local raw
-    raw=$(fuser /dev/nvidia* 2>/dev/null) || true
+
+    # Find PIDs holding blocking devices
+    raw=$(fuser /dev/nvidia0 /dev/nvidia-modeset /dev/nvidia-uvm /dev/nvidia-uvm-tools 2>/dev/null) || true
     for p in $raw; do
         p="${p%%[a-zA-Z]*}"
-        if [[ -n "$p" && -z "${seen_pids[$p]:-}" ]]; then
-            pids+=("$p")
-            seen_pids[$p]=1
+        if [[ -n "$p" ]]; then
+            blocking_pids[$p]=1
         fi
+    done
+
+    # Find PIDs holding only nvidiactl (not in blocking set)
+    raw=$(fuser /dev/nvidiactl 2>/dev/null) || true
+    for p in $raw; do
+        p="${p%%[a-zA-Z]*}"
+        if [[ -n "$p" && -z "${blocking_pids[$p]:-}" ]]; then
+            ctl_only_pids[$p]=1
+        fi
+    done
+
+    # Report non-blocking processes (informational only)
+    if [[ ${#ctl_only_pids[@]} -gt 0 ]]; then
+        echo "  Note: the following processes hold /dev/nvidiactl only (non-blocking, ignored):"
+        for pid in "${!ctl_only_pids[@]}"; do
+            local comm
+            comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
+            echo "    • $comm (PID $pid)"
+        done
+    fi
+
+    # Build deduplicated PID list from blocking devices only
+    local -a pids=()
+    for p in "${!blocking_pids[@]}"; do
+        pids+=("$p")
     done
 
     if [[ ${#pids[@]} -eq 0 ]]; then
