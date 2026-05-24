@@ -75,9 +75,38 @@ get_total_ram_gb() {
 }
 
 allocate_hugepages() {
+    # Check if any VM actually uses hugepages before allocating
+    local needs_hugepages=false
+    for xml in /etc/libvirt/qemu/*.xml; do
+        [[ -f "$xml" ]] || continue
+        if grep -q '<hugepages' "$xml" 2>/dev/null; then
+            needs_hugepages=true
+            break
+        fi
+    done
+
+    if [[ "$needs_hugepages" == "false" ]]; then
+        echo "No VMs configured with hugepages — skipping allocation."
+        return 0
+    fi
+
     local total_ram_gb
     total_ram_gb=$(get_total_ram_gb)
     local vm_mem_gb=$(( total_ram_gb / 2 ))
+
+    # Safety check: ensure enough free memory is available
+    local available_gb
+    available_gb=$(awk '/MemAvailable/ {printf "%d", $2 / 1024 / 1024}' /proc/meminfo)
+    if (( vm_mem_gb > available_gb - 2 )); then
+        # Leave at least 2GB for the host
+        vm_mem_gb=$(( available_gb - 2 ))
+        if (( vm_mem_gb <= 0 )); then
+            echo "WARNING: Not enough free memory to allocate hugepages (available: ${available_gb}GB)."
+            echo "  Skipping hugepage allocation."
+            return 0
+        fi
+        echo "WARNING: Reducing hugepage allocation to ${vm_mem_gb}GB (available: ${available_gb}GB)."
+    fi
 
     echo "Allocating hugepages for ${vm_mem_gb}GB VM memory..."
 
