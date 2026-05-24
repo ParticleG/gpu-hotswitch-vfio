@@ -626,6 +626,14 @@ passthrough_on() {
                     done
                     if [[ "$still_bound" == "true" ]]; then
                         echo "  WARNING: Module removed but device still shows nvidia binding."
+                        # Check if nvidiactl holders may be preventing full release
+                        local ctl_users
+                        ctl_users=$(fuser /dev/nvidiactl 2>/dev/null) || true
+                        if [[ -n "$ctl_users" ]] && (( attempt < max_attempts )); then
+                            echo "  /dev/nvidiactl still held — killing holders and retrying..."
+                            sleep 1
+                            continue
+                        fi
                         echo "  Waiting for kernel to release..."
                         sleep 2
                     fi
