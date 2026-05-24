@@ -91,9 +91,26 @@ allocate_hugepages() {
         return 0
     fi
 
-    local total_ram_gb
-    total_ram_gb=$(get_total_ram_gb)
-    local vm_mem_gb=$(( total_ram_gb / 2 ))
+    # Read VM memory size from the XML that uses hugepages
+    local vm_mem_kib=0
+    for xml in /etc/libvirt/qemu/*.xml; do
+        [[ -f "$xml" ]] || continue
+        if grep -q '<hugepages' "$xml" 2>/dev/null; then
+            local mem
+            mem=$(grep -oP '<memory unit="KiB">\K[0-9]+' "$xml" 2>/dev/null | head -1)
+            if [[ -n "$mem" ]] && (( mem > vm_mem_kib )); then
+                vm_mem_kib=$mem
+            fi
+        fi
+    done
+
+    local vm_mem_gb=$(( (vm_mem_kib + 1048575) / 1048576 ))  # round up to GB
+    if (( vm_mem_gb == 0 )); then
+        # Fallback: use half of total RAM
+        local total_ram_gb
+        total_ram_gb=$(get_total_ram_gb)
+        vm_mem_gb=$(( total_ram_gb / 2 ))
+    fi
 
     # Safety check: ensure enough free memory is available
     local available_gb
@@ -116,7 +133,7 @@ allocate_hugepages() {
     echo 3 > /proc/sys/vm/drop_caches
     echo 1 > /proc/sys/vm/compact_memory
 
-    if (( total_ram_gb >= 32 )); then
+    if (( vm_mem_gb >= 16 )); then
         # Use 1GB hugepages — allocate incrementally to avoid system freeze
         local nr_pages=$vm_mem_gb
         echo "Using 1GB hugepages: target ${nr_pages} pages (allocating incrementally)..."
@@ -152,14 +169,13 @@ allocate_hugepages() {
 }
 
 release_hugepages() {
-    local total_ram_gb
-    total_ram_gb=$(get_total_ram_gb)
-
     echo "Releasing hugepages..."
 
-    if (( total_ram_gb >= 32 )); then
+    # Release 1GB hugepages if supported
+    if [[ -f /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages ]]; then
         echo 0 > /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
     fi
+    # Release 2MB hugepages
     sysctl -w vm.nr_hugepages=0 > /dev/null
 
     echo "Hugepages released"
