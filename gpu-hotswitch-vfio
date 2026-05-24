@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # gpu-hotswitch-vfio - Hot-switch GPU passthrough for KVM virtual machines
-# Usage: gpu-hotswitch-vfio {on|off|status}
+# Usage: gpu-hotswitch-vfio {on|off|status|hugepages-alloc|hugepages-free}
 #
 # Automatically detects discrete GPU (NVIDIA or AMD) and manages:
 # - Driver unbinding/rebinding
 # - VFIO-PCI binding
-# - Hugepage allocation/release
+#
+# Hugepage management is available as separate subcommands.
 
 set -euo pipefail
 
@@ -162,6 +163,28 @@ release_hugepages() {
     sysctl -w vm.nr_hugepages=0 > /dev/null
 
     echo "Hugepages released"
+}
+
+_check_hugepages_advice() {
+    # Check if any VM is configured with hugepages
+    local has_hugepages=false
+    for xml in /etc/libvirt/qemu/*.xml; do
+        [[ -f "$xml" ]] || continue
+        if grep -q '<hugepages' "$xml" 2>/dev/null; then
+            has_hugepages=true
+            break
+        fi
+    done
+
+    if [[ "$has_hugepages" == "true" ]]; then
+        echo ""
+        echo "TIP: Your VM is configured with hugepages."
+        echo "  Run 'gpu-hotswitch-vfio hugepages-alloc' before starting the VM for best performance."
+    else
+        echo ""
+        echo "NOTE: No VMs configured with hugepages. Skipping hugepage allocation."
+        echo "  To enable hugepages, add <hugepages/> to <memoryBacking> in your VM XML."
+    fi
 }
 
 # --- GPU passthrough control ---
@@ -719,8 +742,8 @@ passthrough_on() {
         }
     done
 
-    # Allocate hugepages
-    allocate_hugepages
+    # Check if VMs use hugepages and advise user
+    _check_hugepages_advice
 
     # Restart stopped services — they will now bind to iGPU since dGPU is gone
     _restart_stopped_services
@@ -814,8 +837,16 @@ passthrough_off() {
         timeout 5 bash -c "echo '$dev' > /sys/bus/pci/drivers_probe" 2>/dev/null || true
     done
 
-    # Release hugepages
-    release_hugepages
+    # Release hugepages if any are allocated
+    local hp_1g=0 hp_2m=0
+    if [[ -f /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages ]]; then
+        hp_1g=$(cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages)
+    fi
+    hp_2m=$(cat /proc/sys/vm/nr_hugepages)
+    if (( hp_1g > 0 || hp_2m > 0 )); then
+        echo "Releasing hugepages..."
+        release_hugepages
+    fi
 
     # Restart services — dGPU is now available again
     _restart_stopped_services
@@ -869,8 +900,10 @@ case "${1:-}" in
     on)  passthrough_on ;;
     off) passthrough_off ;;
     status) passthrough_status ;;
+    hugepages-alloc) allocate_hugepages ;;
+    hugepages-free)  release_hugepages ;;
     *)
-        echo "Usage: gpu-hotswitch-vfio {on|off|status}" >&2
+        echo "Usage: gpu-hotswitch-vfio {on|off|status|hugepages-alloc|hugepages-free}" >&2
         exit 1
         ;;
 esac
