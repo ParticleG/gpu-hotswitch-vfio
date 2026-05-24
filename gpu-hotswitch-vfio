@@ -260,50 +260,67 @@ _stopped_gpu_services=()
 _STOPPED_SERVICES_FILE="/run/gpu-hotswitch-vfio-stopped-services"
 
 safe_kill_nvidia_users() {
-    # Collect unique PIDs using NVIDIA GPU devices.
+    # Collect unique PIDs using /dev/nvidia* devices.
     # Two-tier detection:
-    #   - "blocking" devices: /dev/nvidia0, /dev/nvidia-modeset, /dev/nvidia-uvm*
-    #     These hold actual GPU resources and MUST be released for driver unload.
-    #   - "non-blocking" device: /dev/nvidiactl
-    #     Only the control interface; processes holding only this do NOT prevent
-    #     driver unload and can be safely ignored.
-    local -A blocking_pids=()
-    local -A ctl_only_pids=()
+    #   - "primary" users: hold /dev/nvidia0, /dev/nvidia-modeset, /dev/nvidia-uvm*
+    #     These actively use GPU resources and must be terminated first.
+    #   - "secondary" users: hold only /dev/nvidiactl (control interface)
+    #     These may prevent driver unload but aren't actively rendering.
+    #     We attempt unload without killing them first; if that fails, they're
+    #     added to the kill list on retry.
+    local -A primary_pids=()
+    local -A secondary_pids=()
     local raw
 
-    # Find PIDs holding blocking devices
+    # Find PIDs holding primary (GPU-active) devices
     raw=$(fuser /dev/nvidia0 /dev/nvidia-modeset /dev/nvidia-uvm /dev/nvidia-uvm-tools 2>/dev/null) || true
     for p in $raw; do
         p="${p%%[a-zA-Z]*}"
         if [[ -n "$p" ]]; then
-            blocking_pids[$p]=1
+            primary_pids[$p]=1
         fi
     done
 
-    # Find PIDs holding only nvidiactl (not in blocking set)
+    # Find PIDs holding only nvidiactl (not in primary set)
     raw=$(fuser /dev/nvidiactl 2>/dev/null) || true
     for p in $raw; do
         p="${p%%[a-zA-Z]*}"
-        if [[ -n "$p" && -z "${blocking_pids[$p]:-}" ]]; then
-            ctl_only_pids[$p]=1
+        if [[ -n "$p" && -z "${primary_pids[$p]:-}" ]]; then
+            secondary_pids[$p]=1
         fi
     done
 
-    # Report non-blocking processes (informational only)
-    if [[ ${#ctl_only_pids[@]} -gt 0 ]]; then
-        echo "  Note: the following processes hold /dev/nvidiactl only (non-blocking, ignored):"
-        for pid in "${!ctl_only_pids[@]}"; do
+    # On first attempt, only target primary users.
+    # On subsequent attempts (retry), include secondary users too.
+    local attempt_num="${1:-1}"
+    local -A seen_pids=()
+    local -a pids=()
+
+    for p in "${!primary_pids[@]}"; do
+        seen_pids[$p]=1
+        pids+=("$p")
+    done
+
+    if (( attempt_num > 1 )) && [[ ${#secondary_pids[@]} -gt 0 ]]; then
+        # Include secondary users on retry — they likely prevented driver unload
+        echo "  Including /dev/nvidiactl holders (may be preventing driver unload):"
+        for pid in "${!secondary_pids[@]}"; do
+            local comm
+            comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
+            echo "    • $comm (PID $pid)"
+            if [[ -z "${seen_pids[$pid]:-}" ]]; then
+                seen_pids[$pid]=1
+                pids+=("$pid")
+            fi
+        done
+    elif [[ ${#secondary_pids[@]} -gt 0 ]]; then
+        echo "  Note: the following processes hold /dev/nvidiactl only (will retry if unload fails):"
+        for pid in "${!secondary_pids[@]}"; do
             local comm
             comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
             echo "    • $comm (PID $pid)"
         done
     fi
-
-    # Build deduplicated PID list from blocking devices only
-    local -a pids=()
-    for p in "${!blocking_pids[@]}"; do
-        pids+=("$p")
-    done
 
     if [[ ${#pids[@]} -eq 0 ]]; then
         return 0
@@ -585,7 +602,7 @@ passthrough_on() {
             while (( attempt < max_attempts )); do
                 attempt=$(( attempt + 1 ))
                 echo "Attempt $attempt/$max_attempts: stopping NVIDIA GPU users..."
-                if ! safe_kill_nvidia_users; then
+                if ! safe_kill_nvidia_users "$attempt"; then
                     echo "Aborted."
                     return 1
                 fi
