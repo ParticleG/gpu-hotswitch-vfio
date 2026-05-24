@@ -668,7 +668,15 @@ passthrough_on() {
 
     # Load vfio-pci and bind devices
     echo "Loading vfio-pci module..."
-    modprobe vfio-pci
+    if ! modprobe vfio-pci 2>/dev/null; then
+        # vfio-pci may be built into the kernel — check if driver is available
+        if [[ ! -d /sys/bus/pci/drivers/vfio-pci ]]; then
+            echo "  ERROR: vfio-pci module not found and driver not available." >&2
+            echo "  Ensure CONFIG_VFIO_PCI is enabled in your kernel." >&2
+            return 1
+        fi
+        echo "  vfio-pci is built-in (not a loadable module)."
+    fi
 
     echo "Binding devices to vfio-pci..."
     for dev in "${all_devices[@]}"; do
