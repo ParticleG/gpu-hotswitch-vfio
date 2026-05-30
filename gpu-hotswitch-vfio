@@ -11,41 +11,286 @@
 set -euo pipefail
 
 # --- Auto-detection functions ---
+#
+# Detection priority:
+#   1. vga_switcheroo / switcherooctl — kernel-level GPU type metadata
+#   2. Display connection check — on laptops, dGPU has no connected displays
+#   3. boot_vga sysfs attribute — boot VGA device is virtually always the iGPU
+#   4. PCI bus heuristic (bus != 00:) — last resort, unreliable on some systems
+#
+# Safety: before any driver unload, we verify the detected dGPU does NOT
+# drive active displays.  This prevents accidental iGPU driver removal
+# (= black screen).
+
+# Check if a PCI device drives any connected display.
+# Returns 0 if at least one display is connected, 1 otherwise.
+_has_connected_displays() {
+    local pci_addr="$1"
+    local card
+    for card in /sys/class/drm/card[0-9]*; do
+        local dev_path
+        dev_path=$(readlink "$card/device" 2>/dev/null || echo "")
+        if [[ "$dev_path" != *"/$pci_addr" ]]; then
+            continue
+        fi
+        local conn
+        for conn in "$card"/*/status; do
+            [[ -f "$conn" ]] || continue
+            local status
+            status=$(cat "$conn" 2>/dev/null || echo "")
+            if [[ "$status" == "connected" ]]; then
+                return 0
+            fi
+        done
+        return 1
+    done
+    return 1  # not a DRM device, so no connected display
+}
+
+# Detect dGPU via vga_switcheroo debugfs.
+# Outputs the dGPU VGA PCI address on success; returns 1 on failure.
+_detect_dgpu_via_switcheroo() {
+    local sw="/sys/kernel/debug/vgaswitcheroo/switch"
+    [[ -r "$sw" ]] || return 1
+
+    local line
+    while IFS= read -r line; do
+        # Format: "INDEX:TYPE:FLAGS:PWR:PCI_ADDR"
+        # TYPE = DIS (discrete VGA function).  Ignore DIS-AUX audio/helper
+        # functions; the IOMMU-group resolver adds those later.
+        if [[ "$line" =~ ^[0-9]+:DIS: ]]; then
+            if [[ "$line" =~ ([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]) ]]; then
+                echo "${BASH_REMATCH[1]}"
+                return 0
+            fi
+        fi
+    done < "$sw"
+    return 1
+}
+
+# Convert switcherooctl's DRI_PRIME=pci-0000_03_00_0 form to a PCI address.
+_switcheroo_env_pci() {
+    local env_str="$1"
+    if [[ "$env_str" =~ DRI_PRIME=pci-([0-9a-fA-F]{4})_([0-9a-fA-F]{2})_([0-9a-fA-F]{2})_([0-9a-fA-F]) ]]; then
+        printf '%s:%s:%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
+        return 0
+    fi
+    return 1
+}
+
+# Detect dGPU via switcherooctl (same switcheroo metadata as gpu-select).
+# This works best for AMD/Mesa GPUs where Environment contains DRI_PRIME=pci-...
+_detect_dgpu_via_switcherooctl() {
+    command -v switcherooctl &>/dev/null || return 1
+
+    local output
+    output=$(switcherooctl list 2>/dev/null) || return 1
+
+    local line discrete="" default_gpu="" env_str=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Device: ]]; then
+            if [[ "$discrete" == "yes" || ( -z "$discrete" && "$default_gpu" == "no" ) ]]; then
+                _switcheroo_env_pci "$env_str" && return 0
+            fi
+            discrete=""
+            default_gpu=""
+            env_str=""
+            continue
+        fi
+
+        if [[ "$line" =~ ^[[:space:]]*Discrete:[[:space:]]*(yes|no) ]]; then
+            discrete="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]*Default:[[:space:]]*(yes|no) ]]; then
+            default_gpu="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]*Environment:[[:space:]]*(.*)$ ]]; then
+            env_str="${BASH_REMATCH[1]}"
+        fi
+    done <<< "$output"
+
+    if [[ "$discrete" == "yes" || ( -z "$discrete" && "$default_gpu" == "no" ) ]]; then
+        _switcheroo_env_pci "$env_str" && return 0
+    fi
+    return 1
+}
+
+# Resolve a VGA PCI address → GPU type + all IOMMU-group devices.
+# Output: first line = GPU type (nvidia/amd), rest = PCI addresses.
+_resolve_gpu_group() {
+    local vga_addr="$1"
+    local gpu_type=""
+
+    local iommu_group
+    iommu_group=$(basename "$(readlink "/sys/bus/pci/devices/$vga_addr/iommu_group" 2>/dev/null)" 2>/dev/null) || return 1
+
+    local dev
+    for dev in /sys/kernel/iommu_groups/"$iommu_group"/devices/*; do
+        local addr vendor
+        addr=$(basename "$dev")
+        vendor=$(cat "$dev/vendor" 2>/dev/null || echo "")
+        case "$vendor" in
+            0x10de) gpu_type="nvidia" ;;
+            0x1002) [[ -z "$gpu_type" ]] && gpu_type="amd" ;;
+        esac
+    done
+
+    [[ -n "$gpu_type" ]] || gpu_type="unknown"
+
+    echo "$gpu_type"
+    for dev in /sys/kernel/iommu_groups/"$iommu_group"/devices/*; do
+        basename "$dev"
+    done
+}
+
+# Find all VGA/3D/Display PCI addresses for our known GPU vendors.
+_find_gpu_vga_devices() {
+    lspci -D -nn 2>/dev/null | grep -Ei '10de:|1002:' | grep -Ei 'VGA|3D|Display' | awk '{print $1}' || true
+}
 
 detect_dgpu() {
-    # Find discrete GPU (NVIDIA vendor 10de, AMD vendor 1002 on non-root PCI bus)
     local gpu_type=""
-    local pci_addrs=()
+    local -a pci_addrs=()
+    local -a vga_candidates=()
+    local resolved dgpu_vga
 
-    # Check for NVIDIA
-    local nvidia_addrs
-    nvidia_addrs=$(lspci -D -nn | grep -i '10de:' | grep -Ei 'VGA|3D|Display|Audio' | awk '{print $1}' || true)
-    if [[ -n "$nvidia_addrs" ]]; then
-        gpu_type="nvidia"
-        while IFS= read -r addr; do
-            pci_addrs+=("$addr")
-        done <<< "$nvidia_addrs"
-    fi
-
-    # Check for AMD discrete (bus != 00, to exclude iGPU)
-    if [[ -z "$gpu_type" ]]; then
-        local amd_addrs
-        amd_addrs=$(lspci -D -nn | grep -i '1002:' | grep -Ei 'VGA|3D|Display|Audio' | grep -v '^0000:00:' | awk '{print $1}' || true)
-        if [[ -n "$amd_addrs" ]]; then
-            gpu_type="amd"
-            while IFS= read -r addr; do
-                pci_addrs+=("$addr")
-            done <<< "$amd_addrs"
+    # --- Method 1: vga_switcheroo (kernel-level, most reliable) ---
+    if dgpu_vga=$(_detect_dgpu_via_switcheroo) && [[ -n "$dgpu_vga" ]]; then
+        if resolved=$(_resolve_gpu_group "$dgpu_vga") && [[ -n "$resolved" ]]; then
+            gpu_type=$(echo "$resolved" | head -1)
+            mapfile -t pci_addrs < <(echo "$resolved" | tail -n +2)
+            if [[ -n "$gpu_type" && "$gpu_type" != "unknown" ]]; then
+                echo "$gpu_type"
+                printf '%s\n' "${pci_addrs[@]}"
+                return 0
+            fi
         fi
     fi
 
-    if [[ -z "$gpu_type" ]]; then
-        echo "ERROR: No discrete GPU detected" >&2
+    # --- Method 1b: switcherooctl (gpu-select-compatible metadata) ---
+    if dgpu_vga=$(_detect_dgpu_via_switcherooctl) && [[ -n "$dgpu_vga" ]]; then
+        if resolved=$(_resolve_gpu_group "$dgpu_vga") && [[ -n "$resolved" ]]; then
+            gpu_type=$(echo "$resolved" | head -1)
+            mapfile -t pci_addrs < <(echo "$resolved" | tail -n +2)
+            if [[ -n "$gpu_type" && "$gpu_type" != "unknown" ]]; then
+                echo "$gpu_type"
+                printf '%s\n' "${pci_addrs[@]}"
+                return 0
+            fi
+        fi
+    fi
+
+    # Gather all GPU VGA candidates
+    mapfile -t vga_candidates < <(_find_gpu_vga_devices)
+
+    # --- Method 2: Display connection heuristic ---
+    # On laptops, the dGPU typically has NO connected displays.
+    if [[ ${#vga_candidates[@]} -ge 2 ]]; then
+        local -a non_display=()
+        local addr
+        for addr in "${vga_candidates[@]}"; do
+            if ! _has_connected_displays "$addr"; then
+                non_display+=("$addr")
+            fi
+        done
+
+        if [[ ${#non_display[@]} -eq 1 ]]; then
+            # Exactly one GPU without displays → dGPU
+            if resolved=$(_resolve_gpu_group "${non_display[0]}") && [[ -n "$resolved" ]]; then
+                gpu_type=$(echo "$resolved" | head -1)
+                mapfile -t pci_addrs < <(echo "$resolved" | tail -n +2)
+                if [[ -n "$gpu_type" && "$gpu_type" != "unknown" ]]; then
+                    echo "$gpu_type"
+                    printf '%s\n' "${pci_addrs[@]}"
+                    return 0
+                fi
+            fi
+        elif [[ ${#non_display[@]} -eq 0 ]]; then
+            echo "NOTE: All GPUs have connected displays (desktop setup?)." >&2
+        fi
+    elif [[ ${#vga_candidates[@]} -eq 1 ]]; then
+        local single="${vga_candidates[0]}"
+        if _has_connected_displays "$single"; then
+            echo "ERROR: Only one GPU detected and it drives the display." >&2
+            echo "  Unbinding it will cause a black screen." >&2
+            echo "  This script refuses to use a display-driving GPU for passthrough." >&2
+            return 1
+        fi
+        # Single GPU without displays (headless server, or VM host w/ serial console)
+        if resolved=$(_resolve_gpu_group "$single") && [[ -n "$resolved" ]]; then
+            gpu_type=$(echo "$resolved" | head -1)
+            mapfile -t pci_addrs < <(echo "$resolved" | tail -n +2)
+            if [[ -n "$gpu_type" && "$gpu_type" != "unknown" ]]; then
+                echo "WARNING: Only one GPU found (headless). Proceeding." >&2
+                echo "$gpu_type"
+                printf '%s\n' "${pci_addrs[@]}"
+                return 0
+            fi
+        fi
+    fi
+
+    # --- Method 3: boot_vga attribute ---
+    # The boot VGA device is virtually always the iGPU.
+    if [[ ${#vga_candidates[@]} -ge 2 ]]; then
+        local boot_vga=""
+        local addr
+        for addr in "${vga_candidates[@]}"; do
+            if [[ "$(cat "/sys/bus/pci/devices/$addr/boot_vga" 2>/dev/null || echo "0")" == "1" ]]; then
+                boot_vga="$addr"
+                break
+            fi
+        done
+        if [[ -n "$boot_vga" ]]; then
+            for addr in "${vga_candidates[@]}"; do
+                if [[ "$addr" != "$boot_vga" ]]; then
+                    if resolved=$(_resolve_gpu_group "$addr") && [[ -n "$resolved" ]]; then
+                        gpu_type=$(echo "$resolved" | head -1)
+                        mapfile -t pci_addrs < <(echo "$resolved" | tail -n +2)
+                        if [[ -n "$gpu_type" && "$gpu_type" != "unknown" ]]; then
+                            echo "NOTE: Detected dGPU via boot_vga heuristic." >&2
+                            echo "$gpu_type"
+                            printf '%s\n' "${pci_addrs[@]}"
+                            return 0
+                        fi
+                    fi
+                fi
+            done
+        fi
+    fi
+
+    # --- Method 4: Bus heuristic (last resort) ---
+    # dGPUs are almost always on a non-root PCI bus (not 00:).
+    local -a bus_nonroot=()
+    local addr
+    for addr in "${vga_candidates[@]}"; do
+        if [[ ! "$addr" =~ ^0000:00: ]]; then
+            bus_nonroot+=("$addr")
+        fi
+    done
+
+    if [[ ${#bus_nonroot[@]} -eq 1 ]]; then
+        if resolved=$(_resolve_gpu_group "${bus_nonroot[0]}") && [[ -n "$resolved" ]]; then
+            gpu_type=$(echo "$resolved" | head -1)
+            mapfile -t pci_addrs < <(echo "$resolved" | tail -n +2)
+            if [[ -n "$gpu_type" && "$gpu_type" != "unknown" ]]; then
+                echo "WARNING: dGPU detection fell back to PCI bus heuristic." >&2
+                echo "  This is unreliable on some systems." >&2
+                echo "  Install switcheroo-control for reliable detection:" >&2
+                echo "    sudo pacman -S switcheroo-control" >&2
+                echo "    sudo systemctl enable --now switcheroo-control.service" >&2
+                echo "$gpu_type"
+                printf '%s\n' "${pci_addrs[@]}"
+                return 0
+            fi
+        fi
+    elif [[ ${#bus_nonroot[@]} -gt 1 ]]; then
+        echo "ERROR: Multiple GPUs on non-root buses (${bus_nonroot[*]})." >&2
+        echo "  Cannot determine the discrete GPU." >&2
+        echo "  Install switcheroo-control: sudo pacman -S switcheroo-control" >&2
         return 1
     fi
 
-    echo "$gpu_type"
-    printf '%s\n' "${pci_addrs[@]}"
+    echo "ERROR: No discrete GPU detected." >&2
+    echo "  Tried: vga_switcheroo, switcherooctl, display check, boot_vga, bus heuristic." >&2
+    return 1
 }
 
 get_iommu_group_devices() {
@@ -589,6 +834,23 @@ passthrough_on() {
     local -a gpu_addrs
     mapfile -t gpu_addrs < <(echo "$detection" | tail -n +2)
 
+    # --- Safety: verify dGPU does NOT drive active displays ---
+    # If the detected dGPU has connected displays, we may have misidentified
+    # it (it's actually the iGPU).  Unbinding it would black-screen the host.
+    local _safety_fail=false
+    local addr
+    for addr in "${gpu_addrs[@]}"; do
+        if _has_connected_displays "$addr"; then
+            echo "SAFETY ERROR: GPU device $addr has connected displays!" >&2
+            echo "  This GPU may be your iGPU.  Refusing to unbind it." >&2
+            echo "  If you are certain this is the dGPU and want to proceed," >&2
+            echo "  physically disconnect the display from this GPU first." >&2
+            _safety_fail=true
+        fi
+    done
+    if [[ "$_safety_fail" == "true" ]]; then
+        return 1
+    fi
     echo "Detected ${gpu_type} GPU at: ${gpu_addrs[*]}"
 
     # Configure compositor to ignore dGPU DRM devices BEFORE killing anything
