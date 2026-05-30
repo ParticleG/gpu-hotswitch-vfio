@@ -113,19 +113,21 @@ _detect_dgpu_via_switcherooctl() {
     return 1
 }
 
-# Resolve a VGA PCI address → GPU type + all IOMMU-group devices.
+# Resolve a VGA PCI address → GPU type + same-slot GPU functions.
 # Output: first line = GPU type (nvidia/amd), rest = PCI addresses.
-_resolve_gpu_group() {
+#
+# Do NOT expand to the full IOMMU group here.  Some AMD laptops place the dGPU
+# and iGPU in the same IOMMU group; treating the whole group as "the dGPU" can
+# include the display-driving iGPU and lead to a black screen.
+_resolve_gpu_functions() {
     local vga_addr="$1"
     local gpu_type=""
-
-    local iommu_group
-    iommu_group=$(basename "$(readlink "/sys/bus/pci/devices/$vga_addr/iommu_group" 2>/dev/null)" 2>/dev/null) || return 1
+    local slot="${vga_addr%.*}"
 
     local dev
-    for dev in /sys/kernel/iommu_groups/"$iommu_group"/devices/*; do
-        local addr vendor
-        addr=$(basename "$dev")
+    for dev in /sys/bus/pci/devices/"$slot".*; do
+        [[ -e "$dev" ]] || continue
+        local vendor
         vendor=$(cat "$dev/vendor" 2>/dev/null || echo "")
         case "$vendor" in
             0x10de) gpu_type="nvidia" ;;
@@ -136,8 +138,43 @@ _resolve_gpu_group() {
     [[ -n "$gpu_type" ]] || gpu_type="unknown"
 
     echo "$gpu_type"
-    for dev in /sys/kernel/iommu_groups/"$iommu_group"/devices/*; do
+    for dev in /sys/bus/pci/devices/"$slot".*; do
+        [[ -e "$dev" ]] || continue
         basename "$dev"
+    done
+}
+
+_is_display_controller() {
+    local pci_addr="$1"
+    local class
+    class=$(cat "/sys/bus/pci/devices/$pci_addr/class" 2>/dev/null || echo "")
+    [[ "$class" == 0x03* ]]
+}
+
+_other_amdgpu_display_devices() {
+    local -A target_devices=()
+    local addr
+    for addr in "$@"; do
+        target_devices["$addr"]=1
+    done
+
+    local card
+    for card in /sys/class/drm/card[0-9]*; do
+        local dev_path pci_addr vendor driver
+        dev_path=$(readlink "$card/device" 2>/dev/null || echo "")
+        [[ -n "$dev_path" ]] || continue
+        pci_addr=$(basename "$dev_path")
+        [[ "$pci_addr" =~ ^[0-9a-fA-F]{4}: ]] || continue
+        [[ -z "${target_devices[$pci_addr]:-}" ]] || continue
+
+        vendor=$(cat "/sys/bus/pci/devices/$pci_addr/vendor" 2>/dev/null || echo "")
+        [[ "$vendor" == "0x1002" ]] || continue
+        driver=$(get_current_driver "$pci_addr")
+        [[ "$driver" == "amdgpu" ]] || continue
+
+        if _has_connected_displays "$pci_addr"; then
+            echo "$pci_addr"
+        fi
     done
 }
 
@@ -154,7 +191,7 @@ detect_dgpu() {
 
     # --- Method 1: vga_switcheroo (kernel-level, most reliable) ---
     if dgpu_vga=$(_detect_dgpu_via_switcheroo) && [[ -n "$dgpu_vga" ]]; then
-        if resolved=$(_resolve_gpu_group "$dgpu_vga") && [[ -n "$resolved" ]]; then
+        if resolved=$(_resolve_gpu_functions "$dgpu_vga") && [[ -n "$resolved" ]]; then
             gpu_type=$(echo "$resolved" | head -1)
             mapfile -t pci_addrs < <(echo "$resolved" | tail -n +2)
             if [[ -n "$gpu_type" && "$gpu_type" != "unknown" ]]; then
@@ -167,7 +204,7 @@ detect_dgpu() {
 
     # --- Method 1b: switcherooctl (gpu-select-compatible metadata) ---
     if dgpu_vga=$(_detect_dgpu_via_switcherooctl) && [[ -n "$dgpu_vga" ]]; then
-        if resolved=$(_resolve_gpu_group "$dgpu_vga") && [[ -n "$resolved" ]]; then
+        if resolved=$(_resolve_gpu_functions "$dgpu_vga") && [[ -n "$resolved" ]]; then
             gpu_type=$(echo "$resolved" | head -1)
             mapfile -t pci_addrs < <(echo "$resolved" | tail -n +2)
             if [[ -n "$gpu_type" && "$gpu_type" != "unknown" ]]; then
@@ -194,7 +231,7 @@ detect_dgpu() {
 
         if [[ ${#non_display[@]} -eq 1 ]]; then
             # Exactly one GPU without displays → dGPU
-            if resolved=$(_resolve_gpu_group "${non_display[0]}") && [[ -n "$resolved" ]]; then
+            if resolved=$(_resolve_gpu_functions "${non_display[0]}") && [[ -n "$resolved" ]]; then
                 gpu_type=$(echo "$resolved" | head -1)
                 mapfile -t pci_addrs < <(echo "$resolved" | tail -n +2)
                 if [[ -n "$gpu_type" && "$gpu_type" != "unknown" ]]; then
@@ -215,7 +252,7 @@ detect_dgpu() {
             return 1
         fi
         # Single GPU without displays (headless server, or VM host w/ serial console)
-        if resolved=$(_resolve_gpu_group "$single") && [[ -n "$resolved" ]]; then
+        if resolved=$(_resolve_gpu_functions "$single") && [[ -n "$resolved" ]]; then
             gpu_type=$(echo "$resolved" | head -1)
             mapfile -t pci_addrs < <(echo "$resolved" | tail -n +2)
             if [[ -n "$gpu_type" && "$gpu_type" != "unknown" ]]; then
@@ -241,7 +278,7 @@ detect_dgpu() {
         if [[ -n "$boot_vga" ]]; then
             for addr in "${vga_candidates[@]}"; do
                 if [[ "$addr" != "$boot_vga" ]]; then
-                    if resolved=$(_resolve_gpu_group "$addr") && [[ -n "$resolved" ]]; then
+                    if resolved=$(_resolve_gpu_functions "$addr") && [[ -n "$resolved" ]]; then
                         gpu_type=$(echo "$resolved" | head -1)
                         mapfile -t pci_addrs < <(echo "$resolved" | tail -n +2)
                         if [[ -n "$gpu_type" && "$gpu_type" != "unknown" ]]; then
@@ -267,7 +304,7 @@ detect_dgpu() {
     done
 
     if [[ ${#bus_nonroot[@]} -eq 1 ]]; then
-        if resolved=$(_resolve_gpu_group "${bus_nonroot[0]}") && [[ -n "$resolved" ]]; then
+        if resolved=$(_resolve_gpu_functions "${bus_nonroot[0]}") && [[ -n "$resolved" ]]; then
             gpu_type=$(echo "$resolved" | head -1)
             mapfile -t pci_addrs < <(echo "$resolved" | tail -n +2)
             if [[ -n "$gpu_type" && "$gpu_type" != "unknown" ]]; then
@@ -851,13 +888,11 @@ passthrough_on() {
     if [[ "$_safety_fail" == "true" ]]; then
         return 1
     fi
-    echo "Detected ${gpu_type} GPU at: ${gpu_addrs[*]}"
+    echo "Detected ${gpu_type} GPU functions at: ${gpu_addrs[*]}"
 
-    # Configure compositor to ignore dGPU DRM devices BEFORE killing anything
-    echo "Ensuring compositor ignores dGPU..."
-    configure_compositor_ignore_dgpu "${gpu_addrs[@]}"
-
-    # Collect ALL IOMMU group devices
+    # Collect all IOMMU group devices for the selected dGPU functions.
+    # VFIO isolation is at IOMMU-group granularity, but the detected GPU
+    # identity remains limited to same-slot dGPU functions above.
     local -a all_devices=()
     local -A seen_devices=()
     for addr in "${gpu_addrs[@]}"; do
@@ -869,12 +904,64 @@ passthrough_on() {
         done < <(get_iommu_group_devices "$addr")
     done
 
-    echo "IOMMU group devices: ${all_devices[*]}"
-
     if [[ ${#all_devices[@]} -eq 0 ]]; then
         echo "ERROR: No IOMMU group devices found. Cannot proceed." >&2
         return 1
     fi
+
+    echo "IOMMU group devices: ${all_devices[*]}"
+
+    # Abort before touching drivers if this IOMMU group also contains another
+    # display controller.  Binding the whole group would take the host GPU down;
+    # binding only part of the group would not be VFIO-isolated.
+    local -A target_devices=()
+    for addr in "${gpu_addrs[@]}"; do
+        target_devices["$addr"]=1
+    done
+
+    local -a unsafe_group_devices=()
+    for dev in "${all_devices[@]}"; do
+        [[ -z "${target_devices[$dev]:-}" ]] || continue
+        if _has_connected_displays "$dev" || _is_display_controller "$dev"; then
+            unsafe_group_devices+=("$dev")
+        fi
+    done
+
+    if [[ ${#unsafe_group_devices[@]} -gt 0 ]]; then
+        echo "ERROR: dGPU IOMMU group contains non-target display/GPU devices:" >&2
+        local dev
+        for dev in "${unsafe_group_devices[@]}"; do
+            local class driver
+            class=$(cat "/sys/bus/pci/devices/$dev/class" 2>/dev/null || echo "unknown")
+            driver=$(get_current_driver "$dev")
+            echo "  $dev (class: $class, driver: $driver)" >&2
+        done
+        echo "Refusing to switch drivers because this would risk the host display." >&2
+        echo "Use an IOMMU/ACS layout where the dGPU functions are isolated first." >&2
+        return 1
+    fi
+
+    # AMD iGPU+dGPU systems share one amdgpu kernel module.  If another AMD
+    # GPU is driving the host display through amdgpu, we must not unload the
+    # module; instead, detach only the selected dGPU functions from amdgpu.
+    local amd_per_device_unbind=false
+    if [[ "$gpu_type" == "amd" ]]; then
+        local -a other_amd_displays=()
+        mapfile -t other_amd_displays < <(_other_amdgpu_display_devices "${gpu_addrs[@]}")
+        if [[ ${#other_amd_displays[@]} -gt 0 ]]; then
+            echo "AMD host display GPU remains on amdgpu:"
+            local dev
+            for dev in "${other_amd_displays[@]}"; do
+                echo "  $dev"
+            done
+            echo "Using per-device amdgpu unbind for the dGPU; the iGPU module stays loaded."
+            amd_per_device_unbind=true
+        fi
+    fi
+
+    # Configure compositor to ignore dGPU DRM devices BEFORE killing anything
+    echo "Ensuring compositor ignores dGPU..."
+    configure_compositor_ignore_dgpu "${gpu_addrs[@]}"
 
     case "$gpu_type" in
         nvidia)
@@ -931,47 +1018,103 @@ passthrough_on() {
             fi
             ;;
         amd)
-            # AMD uses /dev/dri/renderD* — find processes using the dGPU render node
+            # AMD uses /dev/dri/card* and renderD* — find processes using the
+            # selected dGPU nodes before detaching it.
             echo "Stopping AMD GPU users..."
-            local amd_render=""
+            local -a amd_nodes=()
             for addr in "${gpu_addrs[@]}"; do
                 local base="${addr%.*}.0"
-                local rdev="/dev/dri/by-path/pci-${base}-render"
-                if [[ -e "$rdev" ]]; then
-                    amd_render=$(readlink -f "$rdev")
-                    break
-                fi
+                local node
+                for node in "/dev/dri/by-path/pci-${base}-card" "/dev/dri/by-path/pci-${base}-render"; do
+                    if [[ -e "$node" ]]; then
+                        amd_nodes+=("$(readlink -f "$node")")
+                    fi
+                done
             done
-            if [[ -n "$amd_render" ]]; then
-                local amd_pids
-                amd_pids=$(fuser "$amd_render" 2>/dev/null | tr -s ' ') || true
-                if [[ -n "$amd_pids" ]]; then
-                    echo "  Processes using AMD dGPU ($amd_render):"
-                    fuser -v "$amd_render" 2>/dev/null || true
-                    echo "  Sending SIGTERM..."
-                    for p in $amd_pids; do
+
+            if [[ ${#amd_nodes[@]} -gt 0 ]]; then
+                local amd_raw
+                amd_raw=$(fuser "${amd_nodes[@]}" 2>/dev/null | tr -s ' ') || true
+                if [[ -n "$amd_raw" ]]; then
+                    echo "  Processes using AMD dGPU nodes:"
+                    fuser -v "${amd_nodes[@]}" 2>/dev/null || true
+
+                    local -A seen_amd_pids=()
+                    local -a amd_pids=()
+                    local p
+                    for p in $amd_raw; do
                         p="${p%%[a-zA-Z]*}"
+                        if [[ -n "$p" && -z "${seen_amd_pids[$p]:-}" ]]; then
+                            amd_pids+=("$p")
+                            seen_amd_pids[$p]=1
+                        fi
+                    done
+
+                    local -a protected_re=(
+                        'niri' 'hyprland' 'sway' 'kwin' 'gnome-shell' 'mutter'
+                        'weston' 'labwc' 'wayfire' 'Xorg' 'Xwayland'
+                        'xwayland-satellite' 'quickshell' 'dms-shell'
+                        'gdm' 'sddm' 'greetd' 'tuigreet' 'login'
+                    )
+                    local re protected_found=false
+                    re=$(IFS='|'; echo "${protected_re[*]}")
+
+                    for p in "${amd_pids[@]}"; do
+                        local comm
+                        comm=$(cat "/proc/$p/comm" 2>/dev/null || echo "")
+                        if [[ -n "$comm" ]] && echo "$comm" | grep -qEi "($re)"; then
+                            echo "  Protected process still holds the dGPU: $comm (PID $p)" >&2
+                            protected_found=true
+                        fi
+                    done
+                    if [[ "$protected_found" == "true" ]]; then
+                        echo "  Reload/stop the compositor or close the session using the dGPU, then retry." >&2
+                        return 1
+                    fi
+
+                    echo "  Sending SIGTERM..."
+                    for p in "${amd_pids[@]}"; do
                         [[ -n "$p" ]] && kill -TERM "$p" 2>/dev/null || true
                     done
                     sleep 2
                 fi
             fi
 
-            echo "Unloading AMD GPU module..."
-            rmmod amdgpu 2>/dev/null || true
+            if [[ "$amd_per_device_unbind" == "true" ]]; then
+                echo "Unbinding AMD dGPU functions from amdgpu (iGPU stays active)..."
+                for addr in "${gpu_addrs[@]}"; do
+                    local current_driver
+                    current_driver=$(get_current_driver "$addr")
+                    if [[ "$current_driver" == "amdgpu" ]]; then
+                        timeout 5 bash -c "echo '$addr' > /sys/bus/pci/drivers/amdgpu/unbind" 2>/dev/null || {
+                            echo "  ERROR: amdgpu unbind of $addr timed out or failed." >&2
+                            return 1
+                        }
+                    fi
+                done
 
-            if lsmod | grep -q '^amdgpu'; then
-                echo "WARNING: amdgpu module still loaded."
-                echo "  Some processes may still be using the GPU."
+                for addr in "${gpu_addrs[@]}"; do
+                    if [[ "$(get_current_driver "$addr")" == "amdgpu" ]]; then
+                        echo "  ERROR: $addr is still bound to amdgpu after unbind." >&2
+                        return 1
+                    fi
+                done
+            else
+                echo "Unloading AMD GPU module..."
+                rmmod amdgpu 2>/dev/null || true
+
+                if lsmod | grep -q '^amdgpu'; then
+                    echo "WARNING: amdgpu module still loaded."
+                    echo "  Some processes may still be using the GPU."
+                fi
             fi
             ;;
     esac
 
-    # Unbind all devices from current drivers
-    # NOTE: If rmmod succeeded, devices are already auto-unbound by the kernel.
-    # Only unbind devices still bound to OTHER drivers (e.g. snd_hda_intel for audio).
-    # NEVER attempt to unbind from nvidia/amdgpu — if rmmod failed, unbind will
-    # deadlock the kernel; if rmmod succeeded, they're already unbound.
+    # Unbind all remaining non-GPU devices from current drivers.
+    # GPU drivers must already be detached by the vendor-specific path above:
+    # NVIDIA via rmmod, AMD either via rmmod or selected per-device amdgpu unbind
+    # when the host iGPU keeps the shared amdgpu module loaded.
     echo "Unbinding devices from current drivers..."
     for dev in "${all_devices[@]}"; do
         local current_driver
@@ -979,10 +1122,10 @@ passthrough_on() {
         if [[ "$current_driver" == "none" || "$current_driver" == "vfio-pci" ]]; then
             continue
         fi
-        # Skip GPU drivers — rmmod handles these; manual unbind risks kernel deadlock
+        # GPU drivers should already be gone; do not try an unplanned fallback here.
         if [[ "$current_driver" == "nvidia" || "$current_driver" == "amdgpu" || "$current_driver" == "nouveau" ]]; then
-            echo "  $dev: still bound to $current_driver (rmmod may have failed)"
-            echo "  ERROR: Cannot safely unbind GPU driver. Aborting." >&2
+            echo "  $dev: still bound to $current_driver"
+            echo "  ERROR: GPU driver detach did not complete. Aborting." >&2
             return 1
         fi
         # Non-GPU drivers (e.g. snd_hda_intel) are safe to unbind
@@ -1133,25 +1276,55 @@ passthrough_off() {
     echo "=== GPU VFIO passthrough disabled ==="
 }
 
+_pci_device_summary() {
+    local pci_addr="$1"
+    local class vendor device
+    class=$(cat "/sys/bus/pci/devices/$pci_addr/class" 2>/dev/null || echo "unknown")
+    vendor=$(cat "/sys/bus/pci/devices/$pci_addr/vendor" 2>/dev/null || echo "unknown")
+    device=$(cat "/sys/bus/pci/devices/$pci_addr/device" 2>/dev/null || echo "unknown")
+    echo "$pci_addr class=$class vendor=$vendor device=$device"
+}
+
 passthrough_status() {
     echo "=== GPU VFIO Hotswitch Status ==="
 
-    # Show GPU devices and their current drivers
+    # Avoid `lspci -k` here.  On some systems it can hang after runtime
+    # GPU detachment; sysfs driver links are enough for status and are safer.
     echo ""
     echo "GPU Devices:"
-    lspci -D -nn -k 2>/dev/null | grep -A 2 -Ei 'VGA|3D|Display' | head -30
+    local found_gpu=false
+    local dev_path pci_addr class driver
+    for dev_path in /sys/bus/pci/devices/*; do
+        [[ -d "$dev_path" ]] || continue
+        pci_addr=$(basename "$dev_path")
+        class=$(cat "$dev_path/class" 2>/dev/null || echo "")
+        [[ "$class" == 0x03* ]] || continue
+        found_gpu=true
+        driver=$(get_current_driver "$pci_addr")
+        echo "  $(_pci_device_summary "$pci_addr")"
+        echo "      Driver: $driver"
+        if _has_connected_displays "$pci_addr"; then
+            echo "      Displays: connected"
+        fi
+    done
+    if [[ "$found_gpu" == "false" ]]; then
+        echo "  (none)"
+    fi
 
     echo ""
     echo "VFIO-PCI bound devices:"
+    local found_vfio=false
     if [[ -d /sys/bus/pci/drivers/vfio-pci ]]; then
-        for dev_path in /sys/bus/pci/drivers/vfio-pci/*/; do
-            [[ -d "$dev_path" ]] || { echo "  (none)"; break; }
-            local pci_addr
+        for dev_path in /sys/bus/pci/drivers/vfio-pci/*; do
+            [[ -e "$dev_path" ]] || continue
             pci_addr=$(basename "$dev_path")
-            # Skip non-PCI entries like "module"
             [[ "$pci_addr" =~ ^[0-9a-fA-F]{4}: ]] || continue
-            echo "  $pci_addr: $(lspci -s "${pci_addr#*:}" 2>/dev/null || echo 'unknown')"
+            found_vfio=true
+            echo "  $(_pci_device_summary "$pci_addr")"
         done
+        if [[ "$found_vfio" == "false" ]]; then
+            echo "  (none)"
+        fi
     else
         echo "  vfio-pci module not loaded"
     fi
