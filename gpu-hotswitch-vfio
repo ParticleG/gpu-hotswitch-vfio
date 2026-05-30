@@ -351,6 +351,17 @@ get_current_driver() {
     fi
 }
 
+set_pci_runtime_pm_on() {
+    local dev control
+    for dev in "$@"; do
+        control="/sys/bus/pci/devices/$dev/power/control"
+        [[ -w "$control" ]] || continue
+        timeout 5 bash -c "echo 'on' > '$control'" 2>/dev/null || {
+            echo "  WARNING: failed to disable runtime PM for $dev"
+        }
+    done
+}
+
 # --- Hugepage management ---
 
 get_total_ram_gb() {
@@ -941,6 +952,11 @@ passthrough_on() {
         return 1
     fi
 
+    # Keep target devices fully powered during detach/bind.  Runtime PM after
+    # vfio-pci bind has triggered kernel hangs on this platform.
+    echo "Disabling runtime PM for passthrough devices..."
+    set_pci_runtime_pm_on "${all_devices[@]}"
+
     # AMD iGPU+dGPU systems share one amdgpu kernel module.  If another AMD
     # GPU is driving the host display through amdgpu, we must not unload the
     # module; instead, detach only the selected dGPU functions from amdgpu.
@@ -1161,6 +1177,10 @@ passthrough_on() {
             echo "  ERROR: Failed to probe $dev" >&2
             return 1
         }
+        # Prevent vfio-pci runtime-suspend on this hot-detached GPU.  On this
+        # platform vfio_pci_core_runtime_suspend has triggered a kernel oops,
+        # leaving later lspci/virt-manager probes stuck in pm_runtime_barrier.
+        set_pci_runtime_pm_on "$dev"
     done
 
     # Check if VMs use hugepages and advise user
@@ -1230,6 +1250,9 @@ passthrough_off() {
         fi
     done
 
+    echo "Disabling runtime PM for vfio-pci devices..."
+    set_pci_runtime_pm_on "${vfio_devices[@]}"
+
     # Clear driver overrides and unbind from vfio-pci
     echo "Unbinding devices from vfio-pci..."
     for dev in "${vfio_devices[@]}"; do
@@ -1256,6 +1279,7 @@ passthrough_off() {
     echo "Reprobing devices..."
     for dev in "${vfio_devices[@]}"; do
         timeout 5 bash -c "echo '$dev' > /sys/bus/pci/drivers_probe" 2>/dev/null || true
+        set_pci_runtime_pm_on "$dev"
     done
 
     # Release hugepages if any are allocated
