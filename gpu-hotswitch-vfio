@@ -1034,16 +1034,35 @@ passthrough_on() {
             fi
             ;;
         amd)
-            # AMD uses /dev/dri/card* and renderD* — find processes using the
-            # selected dGPU nodes before detaching it.
+            # AMD uses /dev/dri/card*, renderD*, and per-GPU I2C adapters.
+            # DMS/monitor tools may hold only /dev/i2c-* for the dGPU; if they
+            # touch that adapter while amdgpu is unbinding, amdgpu can oops in
+            # amdgpu_dm_i2c_xfer/dm_read_reg_func.  Treat those I2C nodes as
+            # dGPU users too, and wait until they are gone before unbind.
             echo "Stopping AMD GPU users..."
+            local -A seen_amd_nodes=()
             local -a amd_nodes=()
             for addr in "${gpu_addrs[@]}"; do
                 local base="${addr%.*}.0"
                 local node
                 for node in "/dev/dri/by-path/pci-${base}-card" "/dev/dri/by-path/pci-${base}-render"; do
                     if [[ -e "$node" ]]; then
-                        amd_nodes+=("$(readlink -f "$node")")
+                        local resolved_node
+                        resolved_node=$(readlink -f "$node")
+                        if [[ -z "${seen_amd_nodes[$resolved_node]:-}" ]]; then
+                            amd_nodes+=("$resolved_node")
+                            seen_amd_nodes["$resolved_node"]=1
+                        fi
+                    fi
+                done
+
+                local i2c_dev
+                for i2c_dev in /sys/bus/pci/devices/"$base"/i2c-*/i2c-dev/i2c-*; do
+                    [[ -e "$i2c_dev" ]] || continue
+                    node="/dev/$(basename "$i2c_dev")"
+                    if [[ -e "$node" && -z "${seen_amd_nodes[$node]:-}" ]]; then
+                        amd_nodes+=("$node")
+                        seen_amd_nodes["$node"]=1
                     fi
                 done
             done
@@ -1062,7 +1081,7 @@ passthrough_on() {
                         p="${p%%[a-zA-Z]*}"
                         if [[ -n "$p" && -z "${seen_amd_pids[$p]:-}" ]]; then
                             amd_pids+=("$p")
-                            seen_amd_pids[$p]=1
+                            seen_amd_pids["$p"]=1
                         fi
                     done
 
@@ -1090,9 +1109,37 @@ passthrough_on() {
 
                     echo "  Sending SIGTERM..."
                     for p in "${amd_pids[@]}"; do
-                        [[ -n "$p" ]] && kill -TERM "$p" 2>/dev/null || true
+                        [[ -n "$p" ]] || continue
+                        pkill -TERM -P "$p" 2>/dev/null || true
+                        kill -TERM "$p" 2>/dev/null || true
                     done
-                    sleep 2
+
+                    local waited=0
+                    while (( waited < 10 )); do
+                        amd_raw=$(fuser "${amd_nodes[@]}" 2>/dev/null | tr -s ' ') || true
+                        [[ -z "$amd_raw" ]] && break
+                        sleep 1
+                        waited=$(( waited + 1 ))
+                    done
+
+                    if [[ -n "$amd_raw" ]]; then
+                        echo "  Some AMD dGPU users did not exit, sending SIGKILL..."
+                        local -A killed=()
+                        for p in $amd_raw; do
+                            p="${p%%[a-zA-Z]*}"
+                            [[ -n "$p" && -z "${killed[$p]:-}" ]] || continue
+                            killed["$p"]=1
+                            pkill -KILL -P "$p" 2>/dev/null || true
+                            kill -KILL "$p" 2>/dev/null || true
+                        done
+                        sleep 1
+                        amd_raw=$(fuser "${amd_nodes[@]}" 2>/dev/null | tr -s ' ') || true
+                        if [[ -n "$amd_raw" ]]; then
+                            echo "  ERROR: dGPU nodes are still in use; refusing to unbind amdgpu." >&2
+                            fuser -v "${amd_nodes[@]}" 2>/dev/null || true
+                            return 1
+                        fi
+                    fi
                 fi
             fi
 
