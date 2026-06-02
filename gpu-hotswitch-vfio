@@ -369,8 +369,12 @@ get_total_ram_gb() {
 }
 
 allocate_hugepages() {
-    # Check if any VM actually uses hugepages before allocating
+    echo "=== GPU VFIO Hotswitch — Hugepage Allocation ==="
+    echo ""
+
+    # Check if any VM actually uses hugepages before allocating.
     local needs_hugepages=false
+    local xml
     for xml in /etc/libvirt/qemu/*.xml; do
         [[ -f "$xml" ]] || continue
         if grep -q '<hugepages' "$xml" 2>/dev/null; then
@@ -384,32 +388,68 @@ allocate_hugepages() {
         return 0
     fi
 
-    # Read VM memory size from the XML that uses hugepages
+    # Read VM memory size from XMLs that use hugepages.
+    # Libvirt may format attributes with single quotes and may split <memory>
+    # across lines, so flatten the XML and parse with Bash regexes.
     local vm_mem_kib=0
+    echo "Scanning VMs with hugepages:"
     for xml in /etc/libvirt/qemu/*.xml; do
         [[ -f "$xml" ]] || continue
-        if grep -q '<hugepages' "$xml" 2>/dev/null; then
-            local mem
-            mem=$(grep -oP '<memory unit="KiB">\K[0-9]+' "$xml" 2>/dev/null | head -1)
-            if [[ -n "$mem" ]] && (( mem > vm_mem_kib )); then
-                vm_mem_kib=$mem
+        if ! grep -q '<hugepages' "$xml" 2>/dev/null; then
+            continue
+        fi
+
+        echo "  Found: $(basename "$xml")"
+
+        local flat_xml mem="" re_kib re_mib re_bare re_memory
+        flat_xml=$(tr -d '\n\r' < "$xml")
+        re_kib="<memory[^>]*unit[[:space:]]*=[[:space:]]*['\"]KiB['\"][^>]*>[[:space:]]*([0-9]+)"
+        re_mib="<memory[^>]*unit[[:space:]]*=[[:space:]]*['\"]MiB['\"][^>]*>[[:space:]]*([0-9]+)"
+        re_bare="<memory>[[:space:]]*([0-9]+)"
+
+        if [[ "$flat_xml" =~ $re_kib ]]; then
+            mem="${BASH_REMATCH[1]}"
+            echo "    memory (KiB): ${mem}"
+        elif [[ "$flat_xml" =~ $re_mib ]]; then
+            mem=$(( BASH_REMATCH[1] * 1024 ))
+            echo "    memory (MiB): ${mem} KiB"
+        elif [[ "$flat_xml" =~ $re_bare ]]; then
+            mem="${BASH_REMATCH[1]}"
+            echo "    memory (bare, KiB): ${mem}"
+        else
+            re_memory="<memory[^>]*>[^<]*"
+            if [[ "$flat_xml" =~ $re_memory ]]; then
+                echo "    raw <memory>: ${BASH_REMATCH[0]}"
             fi
+            echo "    WARNING: Could not parse <memory> element; check XML format."
+        fi
+
+        if [[ -n "$mem" ]] && (( mem > 0 )) && (( mem > vm_mem_kib )); then
+            vm_mem_kib=$mem
         fi
     done
 
-    local vm_mem_gb=$(( (vm_mem_kib + 1048575) / 1048576 ))  # round up to GB
+    local vm_mem_gb=$(( (vm_mem_kib + 1048575) / 1048576 ))  # round up to GiB
     if (( vm_mem_gb == 0 )); then
-        # Fallback: use half of total RAM
+        # Fallback: use half of total RAM.
         local total_ram_gb
         total_ram_gb=$(get_total_ram_gb)
         vm_mem_gb=$(( total_ram_gb / 2 ))
+        echo "NOTE: Could not determine VM memory from XML; using fallback: ${vm_mem_gb}GB (half of total RAM)."
     fi
 
-    # Safety check: ensure enough free memory is available
+    # Safety check: ensure enough free memory is available.
     local available_gb
     available_gb=$(awk '/MemAvailable/ {printf "%d", $2 / 1024 / 1024}' /proc/meminfo)
+    if [[ -z "$available_gb" ]]; then
+        available_gb=$(awk '/MemFree/ {printf "%d", $2 / 1024 / 1024}' /proc/meminfo)
+    fi
+    if [[ -z "$available_gb" ]]; then
+        echo "ERROR: Could not determine available memory from /proc/meminfo."
+        return 1
+    fi
     if (( vm_mem_gb > available_gb - 2 )); then
-        # Leave at least 2GB for the host
+        # Leave at least 2GB for the host.
         vm_mem_gb=$(( available_gb - 2 ))
         if (( vm_mem_gb <= 0 )); then
             echo "WARNING: Not enough free memory to allocate hugepages (available: ${available_gb}GB)."
@@ -421,55 +461,73 @@ allocate_hugepages() {
 
     echo "Allocating hugepages for ${vm_mem_gb}GB VM memory..."
 
-    # Flush caches and compact memory
+    # Flush caches and compact memory. These are best-effort; allocation below
+    # reports the real result.
     sync
-    echo 3 > /proc/sys/vm/drop_caches
-    echo 1 > /proc/sys/vm/compact_memory
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
 
     if (( vm_mem_gb >= 16 )); then
-        # Use 1GB hugepages — allocate incrementally to avoid system freeze
+        # Use 1GB hugepages — allocate incrementally to avoid system freeze.
         local nr_pages=$vm_mem_gb
         echo "Using 1GB hugepages: target ${nr_pages} pages (allocating incrementally)..."
 
-        local current=0
-        local batch=4  # allocate 4GB at a time
-        while (( current < nr_pages )); do
-            local target=$(( current + batch ))
-            if (( target > nr_pages )); then
-                target=$nr_pages
-            fi
-            echo "$target" > /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
-            current=$(cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages)
-            echo "  Allocated: ${current}/${nr_pages} x 1GB hugepages"
-            if (( current < target )); then
-                echo "  WARNING: Could only allocate ${current} pages (fragmentation?)"
-                break
-            fi
-            # Brief pause to let system breathe
-            sleep 0.2
-        done
+        if [[ ! -f /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages ]]; then
+            echo "WARNING: 1GB hugepages not supported by kernel; falling back to 2MB hugepages."
+        else
+            local current=0
+            local batch=4  # allocate 4GB at a time
+            while (( current < nr_pages )); do
+                local target=$(( current + batch ))
+                if (( target > nr_pages )); then
+                    target=$nr_pages
+                fi
+                if ! echo "$target" > /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages 2>/dev/null; then
+                    echo "  WARNING: Failed to write 1GB hugepage target (fragmentation or kernel limit?)"
+                    break
+                fi
+                current=$(cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages)
+                echo "  Allocated: ${current}/${nr_pages} x 1GB hugepages"
+                if (( current < target )); then
+                    echo "  WARNING: Could only allocate ${current} pages (fragmentation?)"
+                    break
+                fi
+                # Brief pause to let system breathe.
+                sleep 0.2
+            done
 
-        echo "Allocated: ${current} x 1GB hugepages"
-    else
-        # Use 2MB hugepages
-        local nr_pages=$(( vm_mem_gb * 1024 / 2 ))
-        echo "Using 2MB hugepages: ${nr_pages} pages"
-        sysctl -w vm.nr_hugepages="$nr_pages" > /dev/null
-        local actual
-        actual=$(cat /proc/sys/vm/nr_hugepages)
-        echo "Allocated: ${actual} x 2MB hugepages"
+            echo "Allocated: ${current} x 1GB hugepages"
+            if (( current < nr_pages )); then
+                echo "WARNING: VM requests ${nr_pages}GB, but only ${current}GB of 1GB hugepages are available."
+            fi
+            return 0
+        fi
+    fi
+
+    # Use 2MB hugepages.
+    local nr_pages=$(( vm_mem_gb * 1024 / 2 ))
+    echo "Using 2MB hugepages: ${nr_pages} pages"
+    if ! sysctl -w vm.nr_hugepages="$nr_pages" &>/dev/null; then
+        echo "ERROR: Failed to allocate 2MB hugepages via sysctl."
+        return 1
+    fi
+    local actual
+    actual=$(cat /proc/sys/vm/nr_hugepages)
+    echo "Allocated: ${actual} x 2MB hugepages"
+    if (( actual < nr_pages )); then
+        echo "WARNING: Only ${actual}/${nr_pages} pages allocated (fragmentation?)."
     fi
 }
 
 release_hugepages() {
     echo "Releasing hugepages..."
 
-    # Release 1GB hugepages if supported
+    # Release 1GB hugepages if supported.
     if [[ -f /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages ]]; then
-        echo 0 > /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+        echo 0 > /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages 2>/dev/null || true
     fi
-    # Release 2MB hugepages
-    sysctl -w vm.nr_hugepages=0 > /dev/null
+    # Release 2MB hugepages.
+    sysctl -w vm.nr_hugepages=0 &>/dev/null || true
 
     echo "Hugepages released"
 }
