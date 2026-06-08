@@ -467,44 +467,9 @@ allocate_hugepages() {
     echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
     echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
 
-    if (( vm_mem_gb >= 16 )); then
-        # Use 1GB hugepages — allocate incrementally to avoid system freeze.
-        local nr_pages=$vm_mem_gb
-        echo "Using 1GB hugepages: target ${nr_pages} pages (allocating incrementally)..."
-
-        if [[ ! -f /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages ]]; then
-            echo "WARNING: 1GB hugepages not supported by kernel; falling back to 2MB hugepages."
-        else
-            local current=0
-            local batch=4  # allocate 4GB at a time
-            while (( current < nr_pages )); do
-                local target=$(( current + batch ))
-                if (( target > nr_pages )); then
-                    target=$nr_pages
-                fi
-                if ! echo "$target" > /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages 2>/dev/null; then
-                    echo "  WARNING: Failed to write 1GB hugepage target (fragmentation or kernel limit?)"
-                    break
-                fi
-                current=$(cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages)
-                echo "  Allocated: ${current}/${nr_pages} x 1GB hugepages"
-                if (( current < target )); then
-                    echo "  WARNING: Could only allocate ${current} pages (fragmentation?)"
-                    break
-                fi
-                # Brief pause to let system breathe.
-                sleep 0.2
-            done
-
-            echo "Allocated: ${current} x 1GB hugepages"
-            if (( current < nr_pages )); then
-                echo "WARNING: VM requests ${nr_pages}GB, but only ${current}GB of 1GB hugepages are available."
-            fi
-            return 0
-        fi
-    fi
-
-    # Use 2MB hugepages.
+    # Use 2MB hugepages. Runtime 1GB hugepage allocation requires contiguous
+    # 1GiB physical memory blocks and is unreliable after boot on ordinary
+    # desktop workloads; 2MB pages are much more likely to allocate on demand.
     local nr_pages=$(( vm_mem_gb * 1024 / 2 ))
     echo "Using 2MB hugepages: ${nr_pages} pages"
     if ! sysctl -w vm.nr_hugepages="$nr_pages" &>/dev/null; then

@@ -92,7 +92,7 @@ Hugepage allocation is optional. If your VM XML does not include `<hugepages/>` 
 
 1. Checks if any VM in `/etc/libvirt/qemu/` is configured with `<hugepages/>`
 2. Verifies sufficient available memory (leaves 2GB headroom for host)
-3. Allocates 1GB hugepages incrementally (≥32GB RAM) or 2MB hugepages (<32GB RAM)
+3. Allocates 2MB hugepages on demand for the VM memory size
 4. Skips allocation if no VM uses hugepages
 
 ### `gpu-hotswitch-vfio hugepages-free`

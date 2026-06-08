@@ -30,7 +30,7 @@ Single script: `gpu-hotswitch-vfio` (~880 lines of Bash).
 
 Key sections:
 - **Auto-detection** (`detect_dgpu`, `get_iommu_group_devices`, `get_current_driver`) — finds discrete GPU by PCI vendor ID, resolves IOMMU groups
-- **Hugepage management** (`allocate_hugepages`, `release_hugepages`) — incremental 1GB or 2MB hugepage allocation with OOM safety; checks VM XML for `<hugepages/>` before allocating
+- **Hugepage management** (`allocate_hugepages`, `release_hugepages`) — 2MB hugepage allocation with OOM safety; checks VM XML for `<hugepages/>` before allocating
 - **Process management** (`safe_kill_nvidia_users`) — uses `fuser /dev/nvidia*` to find GPU holders, categorizes into systemd services (auto-stopped) and user processes (interactive confirmation), traces Electron/Chromium parent chains
 - **Compositor integration** (`ensure_compositor_ignores_dgpu`) — patches niri config to set `render-drm-device` and `ignore-drm-device`
 - **Passthrough lifecycle** (`passthrough_on`, `passthrough_off`) — full driver unbind/rebind, vfio-pci binding, service lifecycle management
