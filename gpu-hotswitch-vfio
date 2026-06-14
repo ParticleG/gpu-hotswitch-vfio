@@ -1345,11 +1345,24 @@ passthrough_off() {
             ;;
     esac
 
-    # Reprobe devices
+    # Reprobe devices.  Do not write power/control again after probing: on
+    # some AMD GPUs the post-probe runtime-PM sysfs write can block forever in
+    # the kernel, and `timeout` cannot recover an uninterruptible D-state task.
+    local reprobe_failed=false
     echo "Reprobing devices..."
     for dev in "${vfio_devices[@]}"; do
-        timeout 5 bash -c "echo '$dev' > /sys/bus/pci/drivers_probe" 2>/dev/null || true
-        set_pci_runtime_pm_on "$dev"
+        if ! timeout 5 bash -c "echo '$dev' > /sys/bus/pci/drivers_probe" 2>/dev/null; then
+            echo "  WARNING: failed to reprobe $dev; it may remain unbound"
+            reprobe_failed=true
+            continue
+        fi
+
+        local current_driver
+        current_driver=$(get_current_driver "$dev")
+        if [[ "$current_driver" == "none" || "$current_driver" == "vfio-pci" ]]; then
+            echo "  WARNING: $dev did not bind to a host driver (current: $current_driver)"
+            reprobe_failed=true
+        fi
     done
 
     # Release hugepages if any are allocated
@@ -1363,9 +1376,16 @@ passthrough_off() {
         release_hugepages
     fi
 
-    # Restart services — dGPU is now available again
+    # Restart services even if rebinding failed; they can still fall back to
+    # the host GPU/iGPU, and this keeps service state from being stranded.
     _restart_stopped_services
     rm -f "$_STOPPED_SERVICES_FILE"
+
+    if [[ "$reprobe_failed" == true ]]; then
+        echo "ERROR: VFIO was disabled, but one or more devices failed to bind to host drivers." >&2
+        echo "Run 'gpu-hotswitch-vfio status' and reboot if any device is stuck unbound." >&2
+        return 1
+    fi
 
     echo "=== GPU VFIO passthrough disabled ==="
 }
